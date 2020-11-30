@@ -1,0 +1,424 @@
+\documentclass[12pt,a4paper]{article}	
+\usepackage[landscape,top=1cm,bottom=1.2cm,left=1cm,right=1cm]{geometry}
+\usepackage{listings}
+\usepackage{tabularx}
+\usepackage{graphicx}
+\usepackage{parskip} % Space rather than indent paragraphs
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{versions}
+\usepackage{hyperref}
+
+\begin{document}
+
+\title{Analysis for ``The Average Laboratory Samples a Population of 7,300 Amazon Mechanical Turk Workers''}
+\date{}
+\author{Neil Stewart}
+\maketitle
+
+<<setup, include=FALSE>>=
+options(width=120, reindent.spaces=2)
+opts_chunk$set(size = 'footnotesize', highlight=TRUE, tidy=TRUE, warning=10, tidy.opts=list(keep.blank.line=TRUE, width.cutoff=140))
+rm(list=ls())
+library(lattice)
+library(latticeExtra)
+library(lme4)
+library(Rcapture)
+library(metafor)
+library(reshape2)
+library(MASS)
+library(uuid)
+@
+
+\section{Load data}
+
+<<exec=FALSE>>=
+# Code for making the web version of HITs.RData
+load("../data_2/HITs.RData")
+HITs <- HITs[,.(WorkerId, SubmitTime, WorkTimeInSeconds, filename, location.requirement, HIT.requirement, conditional, pay, median.duration, lab)]
+
+UUIDs <- data.table(WorkerId=unique(HITs$WorkerId))
+UUIDs$UUID <- replicate(n=nrow(UUIDs), UUIDgenerate(use.time=FALSE))
+
+HITs <- merge(HITs, UUIDs, by="WorkerId")
+HITs <- HITs[,WorkerId:=NULL]
+setnames(HITs, "UUID", "WorkerId")
+save(HITs, file="HITs.RData")
+write.csv(HITs, file="HITs.csv", row.names=FALSE)
+
+<<>>=
+load("HITs.RData")
+
+# HITs.RData contains the data.table HITs, with colums:
+#   WorkerId --- Each unique WorkerId has been swapped for a UUID
+#   SubmitTime --- (Column from original MTurk Batch file)
+#   WorkTimeInSeconds --- (Column from original MTurk Batch file)
+#   filename --- The name of the MTurk Batch file
+#   location.requirement --- Location requirement for the HIT (self report from the experimenter)
+#   HIT.requirement --- HIT approval rate requirement (self report from the experimenter)
+#   conditional --- Whether the experiment required participation in an earlier study (self report from the experimenter)
+#   pay --- in dollars, stripped from the Reward column in the original MTurk Batch file
+#   median.duration --- The median WorkTimeInSeconds for each batch
+#   lab --- The surname of the experimenter supplying the data
+@
+
+
+
+\section{Section 2: The Laboratories}
+
+<<>>=
+# Number of HITs
+nrow(HITs)
+# Number of unique workers
+length(unique(HITs$WorkerId))
+# Number of batches
+length(unique(HITs$filename))
+
+# Time range of HITs
+(  time.range <- range(HITs$SubmitTime, na.rm=TRUE)  )
+
+HITs <- HITs[,lab.name:=as.factor(lab)]
+(  date.plot <- xyplot(factor(lab.name, levels=rev(levels(lab.name))) ~ SubmitTime, data=HITs, type=c("p", "g"), pch=".", jitter.y=TRUE, xlab="Date", ylab="Laboratory", factor=1.7, col="black")  )
+
+HITs <- HITs[is.na(HIT.requirement),HIT.requirement:=0]
+(  hit.plot <- histogram(~as.factor(HIT.requirement) | lab.name, data=HITs, layout=c(7,1), scales=list(alternating=FALSE, x=list(rot=90)), xlab="HIT Rate Requirement / %")  )
+
+(  location.plot <- histogram(~factor(location.requirement, levels=c("", "UNITED STATES", "INDIA", "AU, NZ, GB, UNITED STATES"), labels=c("None", "US", "India", "AU/NZ/GB/US")) | lab.name, data=HITs, layout=c(7,1), scales=list(alternating=FALSE, x=list(rot=90)), xlab="Location Requirement")  )
+
+HITs <- HITs[,median.duration:=median(WorkTimeInSeconds),by=filename]
+HITs <- HITs[,median.payrate:=pay/median.duration*60*60] # Dollars per hour
+median.pay.by.duration <- HITs[,.(median.duration=median(WorkTimeInSeconds), N=.N, pay=median(pay)),by=.(filename,lab.name)]
+
+# Median duration in minutes
+median(HITs$WorkTimeInSeconds)/60
+# Median pay
+median(HITs$pay)
+# Median hourly pay
+median(with(HITs, pay/WorkTimeInSeconds*60*60))
+
+(  pay.by.duration.plot <- xyplot(pay~median.duration/60 | lab.name, data=median.pay.by.duration, cex=sqrt(median.pay.by.duration$N)/10, scales=list(alternating=FALSE, relation="free", y=list(rot=0)), layout=c(7,1), xlab="Median Duration / Minutes", ylab="Median Pay / $", col="black", type=c("p", "g")) + layer(panel.abline(a=0, b=7.25/60, lty=2))  )
+
+# Figure 1
+h <- .2
+pdf("lab_details_2.pdf", height=14, width=14*210/297*1.2)
+print(date.plot, position=c(0,3*h,1,1))
+print(hit.plot, position=c(0,2*h,1,3*h), newpage=FALSE)
+print(location.plot, position=c(0,1*h,1,2*h), newpage=FALSE)
+print(pay.by.duration.plot, position=c(0,0*h,1,1*h), newpage=FALSE)
+dev.off()
+@
+
+
+
+\section{Section 3: The Size of the MTurk Population}
+<<>>=
+# Back up HITs data.table for later sections
+HITs.original <- HITs
+
+# Add which year quarter
+HITs <- HITs[, quarter:=cut(SubmitTime, "quarter")]
+
+# data.table of workers in each 
+workers.per.batch <- HITs[,.(no.workers=length(unique(WorkerId)), no.HITs=.N),by=.(lab,filename)]
+workers.per.batch <- workers.per.batch[,HITs.per.worker:=no.HITs/no.workers]
+
+# Batches allowing multiple submissions
+multiple.response.filenames <- workers.per.batch[HITs.per.worker>1.1]$filename
+HITs <- HITs[, multiple.responses:=ifelse(filename%in%multiple.response.filenames,"Yes", "No")]
+
+#########################################################
+# Restrict to open experiments without multiple.responses
+#########################################################
+HITs <- HITs[conditional=="Open" & multiple.responses=="No"]
+nrow(HITs)/nrow(HITs.original)
+@
+
+<<>>=
+# The All-Labs estimate
+
+cap.recap.openp <- function(HITs, lab=NA, ...) {
+	# Wrapper to run open-population analysis with descriptive(), capture histories, and openp()
+	# HITs is a data.frame with one row per capture, with columns for WorkerId and quarter
+	capture.histories <- xtabs(~ WorkerId + quarter, data=HITs)
+	capture.histories[capture.histories>1] <- 1
+	capture.histories <- capture.histories[,colSums(capture.histories)>0] # Delete columns for occasions when no one is caught
+	results <- list(periods=colnames(capture.histories))
+	results$descriptive=descriptive(capture.histories)
+	if(lab=="get.from.HITs.data.table")
+        results$lab <- HITs$lab[1]
+	else
+		results$lab <- lab
+	if(ncol(capture.histories)>3) {
+		results$openp <- openp(capture.histories, ...)
+		#if(!missing(keep))
+		#	results$capture.history.freqs <- cbind(histpos.t(ncol(capture.histories)), results$openp$glm$model$Y)
+	}
+	return(results)
+}
+
+# Run the open-population analysis on data from all laboratories
+(  op.all <- cap.recap.openp(HITs, lab="All Labs")  )
+plot(op.all$openp)
+plot(op.all$descriptive)
+
+openp.df <- function(op) {
+	# Convert openp() output to data.frame with confidence intervals
+	add.CIs <- function(d, type, periods) {
+		d <- as.data.frame(d)
+		d$type <- type
+		d$lower <- with(d, estimate - qnorm(0.975) * stderr)
+		d$upper <- with(d, estimate + qnorm(0.975) * stderr)
+		if(type %in% c("Survival Probability","New Workers")) {
+			d$period <- periods[-1]
+			d$period <- as.POSIXct(d$period, "%Y-%m-%d")
+			d$period <- d$period + 3600*24*45
+		} else {
+			d$period <- periods
+			d$period <- as.POSIXct(d$period, "%Y-%m-%d")
+		}
+		d
+	}
+	capture.probs <- add.CIs(op$openp$capture.prob, "Capture Probability", op$periods)
+	survival.probs <- add.CIs(op$openp$survivals, "Survival Probability", op$periods)
+	new.arrivals <- add.CIs(op$openp$birth, "New Workers", op$periods)
+	abundance <- add.CIs(op$openp$N, "Worker Population", op$periods)
+
+	d <- rbind(capture.probs, survival.probs, new.arrivals, abundance)
+	d$lab <- op$lab
+	d
+}
+
+qs <- as.POSIXct(unique(HITs$quarter), "%Y-%m-%d")
+combineLimits(useOuterStrips(segplot(period ~ lower + upper | "All Labs" + type, centers=estimate, data=openp.df(op.all), horizontal=FALSE, xlab="Quarter", ylab="Estimate", scales=list(y=list(relation="free"), x=list(rot=90), alternating=FALSE), type="b", ylim=list(c(0,1), c(0,12000), c(0,1), c(0,25000)), xlim=time.range) + layer(panel.abline(h=c(seq(0,1,.25),seq(0,25000,2500)), alpha=0.1))) + layer(panel.abline(v=qs, alpha=0.1)) + layer(panel.abline(h=10000, col="red")))
+
+# Mean population size estimate over periods
+mean(op.all$openp$N[,"estimate"], na.rm=TRUE)
+@
+
+<<>>=
+# Separate estimates for each lab
+
+# Use by() to run the open-population analysis separately for each lab
+op <- by(HITs, INDICES=list(HITs$lab), FUN=cap.recap.openp, lab="get.from.HITs.data.table")
+# Print results for one lab
+op$Bartels
+op.df <- rbindlist(lapply(op, FUN=openp.df))
+
+combineLimits(useOuterStrips(segplot(period ~ lower + upper | lab+type, centers=estimate, data=op.df, horizontal=FALSE, xlab="Quarter", ylab="Estimate", scales=list(y=list(relation="free"), x=list(rot=90), alternating=FALSE), ylim=rep(list(c(0,1), c(0,12000), c(0,1), c(0,20000)), each=7), xlim=time.range, type="b")) + layer(panel.abline(h=c(seq(0,1,.2),seq(0,25000,2500)), alpha=0.1)) + layer(panel.abline(v=qs, alpha=0.1)) + layer(panel.abline(h=10000, col="red")))
+@
+
+<<>>=
+# Meta analysis to estimate for the average lab
+
+# Just do the meta analysis for one estimate
+workerpop <- op.df[type=="Worker Population"]
+(  ma1 <- rma(y=estimate, sei=stderr, data=workerpop[period=="2013-01-01"])  )
+
+# Now do the meta analysis for all estimates
+do.rma <- function(data) {
+	if(sum(!is.na(data$estimate))>1) {
+		# Only do rma() on data with at least 2 non-NA observations
+		ma1 <- rma(yi=estimate, sei=stderr, data=data)
+		data.frame(type=data$type[1], period=data$period[1], estimate=ma1$b, se=ma1$se, I2=ma1$I2)
+	} else
+		NULL
+}
+# Use by() to run the random-effects meta analysis for each statistic for each period
+estimates <- by(data=op.df, INDICES=list(op.df$type, op.df$period), do.rma)
+estimates <- rbindlist(estimates)
+
+# Median heterogeneity estimate
+median(estimates[type=="Worker Population"]$I2)
+
+# Add 95% CIs
+estimates$lower <- with(estimates, estimate - qnorm(0.975) * se)
+estimates$upper <- with(estimates, estimate + qnorm(0.975) * se)
+estimates$type <- as.character(estimates$type)
+
+useOuterStrips(segplot(period ~ lower + upper | "Average Lab" + type, centers=estimate, data=estimates, horizontal=FALSE, xlab="Quarter", ylab="Estimate", scales=list(y=list(relation="free"), x=list(rot=90), alternating=FALSE), type="b", ylim=list(c(0,1), c(0,12000), c(0,1), c(0,25000)), xlim=time.range)) + layer(panel.abline(h=c(seq(0,1,.25),seq(0,25000,2500)), alpha=0.1)) + layer(panel.abline(v=qs, alpha=0.1)) + layer(panel.abline(h=10000, col="red"))
+
+estimates$lab <- "Average Lab"
+@
+
+<<>>=
+# Plot all together for Figure 2
+all.combined <- rbind(openp.df(op.all), op.df, estimates, fill=TRUE)
+
+(  all.data.op.plot <- combineLimits(useOuterStrips(segplot(period ~ lower + upper | lab+type, centers=estimate, data=all.combined, horizontal=FALSE, xlab="Quarter", ylab="Estimate", scales=list(y=list(relation="free", rot=0), x=list(rot=90), alternating=FALSE), ylim=rep(list(c(0,1), c(0,8000), c(0,1), c(0,25000)), each=9), xlim=time.range, type="b")) + layer(panel.abline(h=c(seq(0,1,.25),seq(0,25000,2500)), alpha=0.1)) + layer(panel.abline(v=qs, alpha=0.1)) + layer(panel.abline(h=10000, col="red")))  )
+
+pdf("open_population_plot.pdf", width=12, height=8)
+all.data.op.plot
+dev.off()
+
+# Means over time
+# Includes the mean over time of the population estimate for the average lab headlined in the title of the paper
+(  est <- estimates[, .(mean.over.time=mean(estimate)), by=type]  )
+
+mean.survival.prob <- est[type=="Survival Probability"]$mean.over.time
+# Half life in months
+log(0.5)/log(mean.survival.prob)/4*12
+@
+
+\section{Section 3.1: Pay}
+
+<<>>=
+histogram(~median.payrate, data=HITs, breaks=0:1000-0.5, xlim=c(0,50))
+HITs <- HITs[,pay.rate.quantile:=cut(median.payrate, quantile(HITs$median.payrate))]
+op <- by(HITs, INDICES=list(HITs$pay.rate.quantile), FUN=cap.recap.openp, lab="get.from.HITs.data.table")
+op.df <- rbindlist(lapply(op, FUN=openp.df))
+
+op.df$lab <- rep(levels(HITs$pay.rate.quantile), each=47)
+
+(  pay.openp <- combineLimits(useOuterStrips(segplot(period ~ lower + upper | lab+type, centers=estimate, data=op.df, horizontal=FALSE, xlab="Quarter", ylab="Estimate", scales=list(y=list(relation="free"), x=list(rot=90), alternating=FALSE), ylim=rep(list(c(0,1), c(0,7500), c(0,1), c(0,20000)), each=4), xlim=time.range, type="b")) + layer(panel.abline(h=c(seq(0,1,.2),seq(0,25000,2500)), alpha=0.1)) + layer(panel.abline(v=qs, alpha=0.1)) + layer(panel.abline(h=10000, col="red")))  )
+
+# Figure 3
+pdf("open_population_by_pay.pdf", width=8, height=8)
+pay.openp
+dev.off()
+@
+
+\section{Section 3.2: Batch Size}
+
+<<>>=
+batch.size <- HITs[,.(batch.size=.N),by=filename]
+batch.size.quantiles <- quantile(batch.size$batch.size)
+
+HITs <- merge(HITs, batch.size, by="filename")
+
+HITs <- HITs[,batch.size.quantile:=cut(batch.size, batch.size.quantiles)]
+op <- by(HITs, INDICES=list(HITs$batch.size.quantile), FUN=cap.recap.openp, lab="get.from.HITs.data.table")
+op.df <- rbindlist(lapply(op, FUN=openp.df))
+
+op.df$lab <- rep(levels(HITs$batch.size.quantile), each=50)
+op.df$lab <- factor(op.df$lab, levels=levels(HITs$batch.size.quantile), labels=c("(1,30]", "(30,100]", "(100,200]", "(200,2710]"))
+# Figure 4
+(  batch.size.openp <- combineLimits(useOuterStrips(segplot(period ~ lower + upper | lab+type, centers=estimate, data=op.df, horizontal=FALSE, xlab="Quarter", ylab="Estimate", scales=list(y=list(relation="free"), x=list(rot=90), alternating=FALSE), ylim=rep(list(c(0,1), c(0,7500), c(0,1), c(0,20000)), each=4), xlim=time.range, type="b")) + layer(panel.abline(h=c(seq(0,1,.2),seq(0,25000,2500)), alpha=0.1)) + layer(panel.abline(v=qs, alpha=0.1)) + layer(panel.abline(h=10000, col="red")))  )
+
+pdf("open_population_by_batch_size.pdf", width=8, height=8)
+batch.size.openp
+dev.off()
+
+op.df[type=="Worker Population", mean(estimate, na.rm=TRUE), by=lab]
+# 95% CIs for averages over time
+op.df.av <- op.df[type=="Worker Population", .(estimate=mean(estimate, na.rm=TRUE), stderr=sqrt(sum(stderr^2, na.rm=TRUE))/sum(!is.na(stderr))) ,by=lab]
+op.df.av <- op.df.av[,lower.CI:=estimate-qnorm(0.975)*stderr]
+op.df.av <- op.df.av[,upper.CI:=estimate+qnorm(0.975)*stderr]
+op.df.av
+@
+
+\section{Section 3.3: Robustness of the Open Population Estimate}
+<<>>=
+# Keeping only people caught fewer than 10 times
+sum(op.all$descriptive$base.freq[,"ui"][10:13])/op.all$descriptive$n # Proportion of workers caught more than 10 times
+keep <- apply(histpos.t(13),1,sum)<10
+# Run open-population analysis only with workers caught fewer than 10 times
+op.all.fewer.than.10 <- cap.recap.openp(HITs, lab="All", keep=keep) 
+
+op.all$openp$N[,"estimate"]
+mean(op.all$openp$N[,"estimate"], na.rm=TRUE)
+mean(op.all$openp$birth[, "estimate"], na.rm = TRUE)
+op.all.fewer.than.10$openp$N[,"estimate"]
+mean(op.all.fewer.than.10$openp$N[,"estimate"], na.rm=TRUE)
+@
+
+<<>>=
+# US workers with a HIT acceptance rate requirement of greater than 80%
+HITs <- HITs.original
+# As before, but also only UNITED STATES and high HIT requirements
+HITs <- HITs[conditional=="Open" & multiple.responses=="No" & location.requirement=="UNITED STATES" & HIT.requirement>50]
+# Fraction remaining compared to original analysis
+nrow(HITs)/nrow(HITs.original)
+
+(  op.all <- cap.recap.openp(HITs, lab="All Labs")  )
+mean(op.all$openp$N[,"estimate"], na.rm=TRUE)
+@
+
+
+
+\section{Repeated Participation}
+
+<<>>=
+HITs <- HITs.original
+
+# The distribution of the number of other batches completed within a laboratory
+
+# Add a column to HITs for the number of batches completed by each worker
+HITs <- HITs[,N.batches:=.N,by=.(WorkerId)]
+# ... and for within each lab
+HITs <- HITs[,N.batches.within.lab:=.N,by=.(WorkerId,lab)]
+
+HITs.all.labs <- HITs
+HITs.all.labs$lab <- "All labs"
+HITs.all.labs <- rbind(HITs, HITs.all.labs)
+
+# Figure 5
+(  no.batches.plot <- histogram(~(N.batches.within.lab-1) | lab, breaks=(-1):1000+0.5, xlim=c(-1,20), data=HITs.all.labs, scales=list(alternating=FALSE), as.table=TRUE, layout=c(8,1), xlab="Number of Other Batches Completed", ylab="Proportion of HITs", type="density")  )
+
+pdf("no_batches_plot.pdf", width=12, height=4)
+no.batches.plot
+dev.off()
+
+round(prop.table(xtabs(~N.batches.within.lab, data=HITs.all.labs[lab=="Bartels"])), digits=2)
+round(prop.table(xtabs(~N.batches.within.lab, data=HITs.all.labs[lab=="All labs"])), digits=2)
+
+
+
+# The distribution of the number of other laboratories visited
+
+# No number of other labs participated in
+workers.by.lab <- HITs[,WorkerId,by=.(WorkerId,lab)]
+workers.by.lab <- workers.by.lab[,N:=.N,by=WorkerId]
+
+# Figure 6
+(  no.labs.plot <- histogram(~(N-1)|lab, data=workers.by.lab, type="density", breaks=(-1):6+0.5, layout=c(7,1), xlab="Number of Other Labs Visited", ylab="Proportion of Workers", scales=list(alternating=FALSE))  )
+pdf("no_labs_plot.pdf", width=12, height=4)
+no.labs.plot
+dev.off()
+
+
+# The joint distribution of worker and laboratory capture probabilities, together with marginal distributions
+HITs <- HITs.original
+
+lab.by.worker <- xtabs(~WorkerId+lab, data=HITs)
+lab.by.worker[lab.by.worker>1] <- 1
+freqs <- melt(lab.by.worker)
+# Select a random sample of 100 workers for modelling, which means results will vary from the sample in the paper
+selected.workers <- sample(unique(freqs$WorkerId), 100)
+selected.freqs <- droplevels(subset(freqs, WorkerId%in%selected.workers))
+
+mm1 <- glmer(value~(1|lab)+(1|WorkerId), data=selected.freqs, family=binomial)
+summary(mm1)
+
+x <- mvrnorm(1e5, rep(fixef(mm1),2), diag(VarCorr(mm1)))
+logit <- function(x) { 1/(1+exp(-x)) }
+x <- logit(x)
+z <- kde2d(x=x[,1],y=x[,2], h=c(0.2,0.2),n=100)
+
+joint.plot <- contourplot(z$z, row.values=z$x, column.values=z$x, xlim=c(-0.05,1.05), ylim=c(-0.05,1.05), xlab="Worker Capture Probability", ylab="Laboratory Capture Probability")
+worker.plot <- densityplot(~x[,1], plot.points=FALSE, xlab="Worker Capture Probability", xlim=c(-0.05,1.05))
+lab.plot <- densityplot(~x[,2], plot.points=FALSE, xlab="Laboratory Capture Probability", xlim=c(-0.05,1.05))
+
+# Figure 7
+plot(worker.plot, split=c(2,2,2,2))
+plot(joint.plot, split=c(2,1,2,2), newpage=FALSE)
+plot(lab.plot, split=c(1,1,2,2), newpage=FALSE)
+
+pdf("worker_capture_prob_density.pdf", width=4, height=4)
+worker.plot
+dev.off()
+
+pdf("lab_capture_prob_density.pdf", width=4, height=4)
+lab.plot
+dev.off()
+
+pdf("joint_capture_prob_density.pdf", width=4, height=4)
+joint.plot
+dev.off()
+
+logit(fixef(mm1)[1])
+quantile(x[,1], c(0.025, 0.975))
+quantile(x[,2], c(0.025, 0.975))
+@
+
+\end{document}
+
